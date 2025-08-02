@@ -1,0 +1,1168 @@
+---
+title: "Biostat 203B Homework 4"
+subtitle: "Due Mar 8 @ 11:59PM"
+author: "Kathy Hoang and 506333118"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    number-sections: false
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    code-fold: false
+execute:
+  eval: true
+---
+
+Display machine information:
+```{r}
+sessionInfo()
+```
+Display my machine memory.
+```{r}
+memuse::Sys.meminfo()
+```
+
+Load database libraries and the tidyverse frontend:
+```{r}
+library(bigrquery)
+library(dbplyr)
+library(DBI)
+library(gt)
+library(gtsummary)
+library(tidyverse)
+```
+
+## Q1. Compile the ICU cohort in HW3 from the Google BigQuery database 
+
+Below is an outline of steps. In this homework, we exclusively work with the BigQuery database and should not use any MIMIC data files stored on our local computer. Transform data as much as possible in BigQuery database and `collect()` the tibble only at the end of Q1.7.
+
+### Q1.1 Connect to BigQuery
+
+Authenticate with BigQuery using the service account token. Please place the service account token (shared via BruinLearn) in the working directory (same folder as your qmd file). Do **not** add this token to your git repository.
+```{r one}
+# path to the service account token
+satoken <- "biostat-203b-2024-winter-313290ce47a6.json"
+# BigQuery authentication using service account
+bq_auth(path = satoken)
+```
+Connect to BigQuery database `mimic4_v2_2` in GCP (Google Cloud Platform), using the project billing account `biostat-203b-2024-winter`.
+```{r}
+# connect to the BigQuery database `biostat-203b-2024-winter.mimic4_v2_2`
+con_bq <- dbConnect(
+  bigrquery::bigquery(),
+  project = "biostat-203b-2024-winter",
+  dataset = "mimic4_v2_2",
+  billing = "biostat-203b-2024-winter"
+)
+con_bq
+```
+List all tables in the `mimic4_v2_2` database.
+```{r}
+dbListTables(con_bq)
+```
+### Q1.2 `icustays` data
+
+Connect to the `icustays` table.
+```{r two}
+# full ICU stays table
+icustays_tble <- tbl(con_bq, "icustays") |>
+  # show_query() |>
+  print(width = Inf)
+```
+
+### Q1.3 `admissions` data
+
+Connect to the `admissions` table.
+```{r three}
+# # TODO
+admissions_tble <- tbl(con_bq, "admissions") |>
+  # show_query() |>
+  # show query shows the SQL query that is being executed (ex. SELECT *)
+  print(width = Inf)
+```
+
+### Q1.4 `patients` data
+
+Connect to the `patients` table.
+```{r four}
+# # TODO
+patients_tble <- tbl(con_bq, "patients") |>
+  # show_query() |>
+  print(width = Inf)
+```
+
+### Q1.5 `labevents` data
+
+Connect to the `labevents` table and retrieve a subset that only contain subjects who appear in `icustays_tble` and the lab items listed in HW3. Only keep the last lab measurements before the ICU stay and pivot lab items to become variables/columns. Write all steps in _one_ chain of pipes.
+
+
+```{r five}
+# from hw3: We are interested in the lab measurements of creatinine (50912),
+# potassium (50971), sodium (50983), chloride (50902), bicarbonate (50882),
+# hematocrit (51221), white blood cell count (51301), and glucose (50931).
+# Retrieve a subset of `labevents.csv.gz` that only containing these items for
+# the patients in `icustays_tble`
+
+# load data tables
+labevents_tble <- tbl(con_bq, "labevents") |>
+  print(width = Inf)
+
+# merge on subject id
+icustays_tble |> print(width = Inf)
+
+d_labitems_tble <- tbl(con_bq, "d_labitems") |>
+  print(width = Inf)
+
+itemid_list <- c(50912, 50971, 50983, 50902, 50882, 51221, 51301, 50931)
+```
+```{r}
+labevents_tble_filtered <- labevents_tble |>
+  # FILTER
+  # filter on item id and subject id
+  filter(itemid %in% itemid_list) |>
+  # right join on icustays_tble: subject id
+  right_join(icustays_tble, by = "subject_id") |>
+  # OH notes: can't filter for item %in% icustays_tble$itemid
+  # because it's a connection to a tibble
+  # nothing has been evaluated yet until print
+
+  # GROUP BY to get the last lab measurements before the ICU stay
+  # group by subject id and item id
+  group_by(subject_id, itemid, stay_id) |>
+  filter(storetime <= intime) |>
+  # keep the last lab measurements before the ICU stay (storetime)
+  slice_max(order_by = storetime) |>
+  ungroup() |>
+  # JOIN to get the label of the lab items
+  # inner join on other d lab and items tables : item id
+  inner_join(d_labitems_tble, by = "itemid") |>
+  # inner_join(d_items, by = "itemid") |>
+  select(subject_id, stay_id, label, value) |>
+  # PIVOT
+  # pivot lab items to become variables/columns
+  pivot_wider(names_from = label, values_from = value) |>
+  arrange(subject_id, stay_id) |>
+  print(width = Inf)
+
+# labevents_tble_filtered  |> print(width = Inf)
+```
+
+### Q1.6 `chartevents` data
+
+
+```{r six}
+# from hw3: We are interested in the vitals for ICU patients:
+# heart rate (220045), systolic non-invasive blood pressure (220179),
+# diastolic non-invasive blood pressure (220180),
+# body temperature in Fahrenheit (223761), and respiratory rate (220210).
+
+# Read in necessary tables
+chartevents_tble <- tbl(con_bq, "chartevents") |>
+  print(width = Inf)
+
+# icustays_tble |>  print(width = Inf)
+
+d_items <- tbl(con_bq, "d_items") |>
+  print(width = Inf)
+
+itemid_list <- c(220045, 220179, 220180, 223761, 220210)
+```
+
+Connect to `chartevents` table and retrieve a subset that only contain subjects who appear in `icustays_tble` and the chart events listed in HW3. Only keep the first chart events during ICU stay and pivot chart events to become variables/columns. Write all steps in _one_ chain of pipes.
+```{r}
+chartevents_tble_filtered <- chartevents_tble |>
+  # FILTER
+  # filter on item id
+  filter(itemid %in% itemid_list) |>
+  # right join on icustays_tble: subject id
+  right_join(icustays_tble, by = "subject_id") |>
+  group_by(subject_id, itemid, stay_id_x) |>
+  # restrict to the first vital measurement within the ICU stay
+  filter(charttime >= intime, charttime <= outtime) |>
+  # get the first
+  slice_min(order_by = charttime) |>
+  ungroup() |>
+  # JOIN to get the label of the lab items
+  # inner join on other d lab and items tables : item id
+  inner_join(d_items, by = "itemid") |>
+  # note: stay_id was duplicated after the right join
+  rename(stay_id = stay_id_x) |>
+  select(subject_id, charttime, label, value, stay_id) |>
+  # PIVOT
+  # pivot lab items to become variables/columns
+  pivot_wider(names_from = label, values_from = value) |>
+  arrange(subject_id, stay_id) |>
+  print(width = Inf)
+
+# chartevents_tble_filtered |> print(width = Inf)
+```
+
+### Q1.7 Put things together
+
+This step is similar to Q7 of HW3. Using _one_ chain of pipes `|>` to perform following data wrangling steps: (i) start with the `icustays_tble`, (ii) merge in admissions and patients tables, (iii) keep adults only (age at ICU intime >= 18), (iv) merge in the labevents and chartevents tables, (v) `collect` the tibble.
+
+```{r seven}
+# from hw3:
+# -   all variables in `icustays_tble`\
+# -   all variables in `admissions_tble`\
+# -   all variables in `patients_tble`
+# -   the last lab measurements before the ICU stay in `labevents_tble`
+# -   the first vital measurements during the ICU stay in `chartevents_tble`
+
+# The final `mimic_icu_cohort` should have one row per ICU stay and columns for
+# each variable.
+
+# print necessary tables
+# icustays_tble |>  print(width = Inf)
+#
+# admissions_tble |>  print(width = Inf)
+#
+# patients_tble |>  print(width = Inf)
+#
+# labevents_tble_filtered |> print(width = Inf)
+#
+# chartevents_tble_filtered |> print(width = Inf)
+
+# step i: start with the icustays_tble
+mimic_icu_cohort_merged <- icustays_tble |>
+  # step ii: MERGE in admissions and patients tables
+  left_join(admissions_tble, by = "subject_id") |>
+  left_join(patients_tble, by = "subject_id") |>
+  # step iii: FILTER keep adults only (age at ICU intime >= 18)
+  mutate(age_at_intime = year(intime) - anchor_year + anchor_age) |>
+  filter(age_at_intime >= 18) |>
+  # step iv: MERGE in the labevents and chartevents tables
+  left_join(labevents_tble_filtered, by = "subject_id") |>
+  left_join(chartevents_tble_filtered, by = "subject_id") |>
+  group_by(subject_id, hadm_id_x, stay_id_x) |>
+  summarize_all(min) |>
+  ungroup() |>
+  # rename(hadm_id = hadm_id_x) |>
+  # rename(stay_id = stay_id_x, hadm_id = hadm_id_x) |>
+  # select(-hadm_id_y) |>
+  # select(-stay_id_y, -hadm_id_y) |>
+  # step v: #COLLECT the tibble
+  arrange(subject_id, hadm_id_x, stay_id) |>
+  collect() |>
+  print(width = Inf)
+
+# mimic_icu_cohort_merged|> print(width = Inf)
+```
+
+```{r}
+# clean up extra columns
+mimic_icu_cohort_merged <- mimic_icu_cohort_merged |>
+  rename(hadm_id = hadm_id_x) |>
+  select(-stay_id_y, -hadm_id_y, -stay_id_x) |>
+  print(width = Inf)
+
+# NOTE EXTRA COLUMN BC I WANTED TO ADD CHARTTIME FOR Q2. if i don't select for
+# charttime it would be 41 columns
+```
+
+### Q1.8 Preprocessing
+
+Perform the following preprocessing steps. (i) Lump infrequent levels into "Other" level for `first_careunit`, `last_careunit`, `admission_type`, `admission_location`, and `discharge_location`. (ii) Collapse the levels of `race` into `ASIAN`, `BLACK`, `HISPANIC`, `WHITE`, and `Other`. (iii) Create a new variable `los_long` that is `TRUE` when `los` is greater than or equal to 2 days. (iv) Summarize the data using `tbl_summary()`, stratified by `los_long`. Hint: `fct_lump` and `fct_collapse` from the `forcats` package can be useful.
+
+Hint: Below is a numerical summary of my tibble after preprocessing:
+
+<iframe width=95% height="500" src="./mimic_icu_cohort_gtsummary.html"></iframe>
+
+```{r eight}
+# look at frequent levels to see which ones are less common
+# less common should be lumped
+table(mimic_icu_cohort_merged$first_careunit)
+# chose n=4 because 4 groups were >10000
+table(mimic_icu_cohort_merged$last_careunit)
+# chose n=4 because 4 groups were >10000
+table(mimic_icu_cohort_merged$admission_type)
+# chose n=4 because top 4 groups were more common
+table(mimic_icu_cohort_merged$admission_location)
+# chose n=3 because 3 groups were in the thousands and more frequent
+table(mimic_icu_cohort_merged$discharge_location)
+## chose n=4 because the rest of the groups were significantly less frequent
+
+# print out all the race categories
+unique(mimic_icu_cohort_merged$race)
+
+# Preprocessing SOLUTION
+
+# step i: Lump infrequent levels into "Other" level for first_careunit,
+# last_careunit, admission_type, admission_location, and discharge_location
+mimic_icu_cohort <- mimic_icu_cohort_merged |>
+  select(-c(
+    hadm_id, stay_id, admit_provider_id, admittime, dischtime,
+    deathtime, edregtime, edouttime, anchor_age,
+    anchor_year, anchor_year, anchor_year_group
+  )) |>
+  mutate(
+    first_careunit = fct_lump(first_careunit, n = 4, other_level = "Other"),
+    last_careunit = fct_lump(last_careunit, n = 4, other_level = "Other"),
+    admission_type = fct_lump(admission_type, n = 4, other_level = "Other"),
+    admission_location = fct_lump(admission_location,
+      n = 3,
+      other_level = "Other"
+    ),
+    discharge_location = fct_lump(discharge_location,
+      n = 4,
+      other_level = "Other"
+    )
+  )
+
+# step ii: Collapse
+mimic_icu_cohort <- mimic_icu_cohort |>
+  mutate(
+    race = fct_collapse(race,
+      ASIAN = c(
+        "ASIAN - SOUTH EAST ASIAN",
+        "ASIAN - CHINESE",
+        "ASIAN",
+        "ASIAN - KOREAN",
+        "ASIAN - ASIAN INDIAN"
+      ),
+      BLACK = c(
+        "BLACK/AFRICAN AMERICAN",
+        "BLACK/CAPE VERDEAN",
+        "BLACK/CARIBBEAN ISLAND",
+        "BLACK/AFRICAN"
+      ),
+      HISPANIC = c(
+        "HISPANIC/LATINO - DOMINICAN",
+        "HISPANIC/LATINO - CENTRAL AMERICAN",
+        "HISPANIC OR LATINO",
+        "HISPANIC/LATINO - GUATEMALAN",
+        "HISPANIC/LATINO - SALVADORAN",
+        "HISPANIC/LATINO - MEXICAN",
+        "HISPANIC/LATINO - PUERTO RICAN",
+        "PORTUGUESE",
+        "SOUTH AMERICAN",
+        "HISPANIC/LATINO - CUBAN",
+        "HISPANIC/LATINO - HONDURAN",
+        "HISPANIC/LATINO - COLUMBIAN"
+      ),
+      WHITE = c(
+        "WHITE",
+        "WHITE - OTHER EUROPEAN",
+        "WHITE - RUSSIAN",
+        "WHITE - BRAZILIAN",
+        "WHITE - EASTERN EUROPEAN"
+      ),
+      Other = c(
+        "OTHER",
+        "PATIENT DECLINED TO ANSWER",
+        "UNKNOWN",
+        "UNABLE TO OBTAIN",
+        "MULTIPLE RACE/ETHNICITY",
+        "AMERICAN INDIAN/ALASKA NATIVE",
+        "NATIVE HAWAIIAN OR OTHER PACIFIC ISLANDER"
+      )
+      # not sure if NH or PI should be Asian or Other
+    )
+  )
+
+# (iii) Create a new variable `los_long` that is `TRUE` when `los` is
+# greater than or equal to 2 days
+mimic_icu_cohort <- mimic_icu_cohort |>
+  mutate(
+    los_long = los >= 2
+  ) |>
+  mutate(race = fct_relevel(
+    race, "ASIAN", "BLACK", "HISPANIC", "WHITE",
+    "Other"
+  ))
+
+# Get rid of spaces in column names
+mimic_icu_cohort <- mimic_icu_cohort |>
+  rename(
+    White_Blood_Cells = `White Blood Cells`,
+    Heart_Rate = `Heart Rate`,
+    Non_Invasive_BP_systolic = `Non Invasive Blood Pressure systolic`,
+    Temperature_Fahrenheit = `Temperature Fahrenheit`,
+    Non_Invasive_BP_diastolic = `Non Invasive Blood Pressure diastolic`,
+    Respiratory_Rate = `Respiratory Rate`
+  )
+
+# data types
+str(mimic_icu_cohort)
+
+mimic_icu_cohort$Bicarbonate <-
+  as.numeric(mimic_icu_cohort$Bicarbonate)
+mimic_icu_cohort$Potassium <- as.numeric(mimic_icu_cohort$Potassium)
+mimic_icu_cohort$Chloride <- as.numeric(mimic_icu_cohort$Chloride)
+mimic_icu_cohort$Glucose <- as.numeric(mimic_icu_cohort$Glucose)
+mimic_icu_cohort$Hematocrit <- as.numeric(mimic_icu_cohort$Hematocrit)
+mimic_icu_cohort$Sodium <- as.numeric(mimic_icu_cohort$Sodium)
+mimic_icu_cohort$White_Blood_Cells <-
+  as.numeric(mimic_icu_cohort$White_Blood_Cells)
+mimic_icu_cohort$Creatinine <- as.numeric(mimic_icu_cohort$Creatinine)
+mimic_icu_cohort$Heart_Rate <- as.numeric(mimic_icu_cohort$Heart_Rate)
+mimic_icu_cohort$Non_Invasive_BP_systolic <-
+  as.numeric(mimic_icu_cohort$Non_Invasive_BP_systolic)
+mimic_icu_cohort$Temperature_Fahrenheit <-
+  as.numeric(mimic_icu_cohort$Temperature_Fahrenheit)
+mimic_icu_cohort$Non_Invasive_BP_diastolic <-
+  as.numeric(mimic_icu_cohort$Non_Invasive_BP_diastolic)
+mimic_icu_cohort$Respiratory_Rate <-
+  as.numeric(mimic_icu_cohort$Respiratory_Rate)
+
+# (iv) Summarize the data using `tbl_summary()`, stratified by `los_long`
+mimic_icu_cohort_tble <- mimic_icu_cohort |>
+  select(-c(subject_id, intime, outtime))
+
+tbl_summary(mimic_icu_cohort_tble, by = los_long)
+```
+
+
+### Q1.9 Save the final tibble
+
+Save the final tibble to an R data file `mimic_icu_cohort.rds` in the `mimiciv_shiny` folder.
+```{r nine}
+# make a directory mimiciv_shiny
+if (!dir.exists("mimiciv_shiny")) {
+  dir.create("mimiciv_shiny")
+}
+# save the final tibble
+mimic_icu_cohort |>
+  write_rds("mimiciv_shiny/mimic_icu_cohort.rds", compress = "gz")
+```
+Close database connection and clear workspace.
+```{r}
+if (exists("con_bq")) {
+  dbDisconnect(con_bq)
+}
+rm(list = ls())
+```
+Although it is not a good practice to add big data files to git, for grading purpose, please add `mimic_icu_cohort.rds` to your git repository.
+
+## Q2. Shiny app
+
+Develop a Shiny app for exploring the ICU cohort data created in Q1. The app should reside in the `mimiciv_shiny` folder. The app should contains at least two tabs. One tab provides easy access to the graphical and numerical summaries of variables (demographics, lab measurements, vitals) in the ICU cohort. The other allows user to choose a specific patient in the cohort and display the patient's ADT and ICU stay information as we did in Q1 of HW3.
+
+```{r}
+# load library
+library(shiny)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(tidyr)
+```
+
+
+```{r}
+mimic_icu_cohort_data <- readRDS("./mimiciv_shiny/mimic_icu_cohort.rds")
+head(mimic_icu_cohort_data)
+```
+
+```{r}
+# charttime was missing so had to go back to Q1 to reselect
+
+transfers_tbl <- mimic_icu_cohort_data %>%
+  select(subject_id, charttime, intime, outtime, first_careunit) |>
+  mutate(
+    intime = as.POSIXct(intime),
+    outtime = as.POSIXct(outtime),
+    charttime = as.POSIXct(charttime),
+    chartdate = as.Date(charttime),
+    first_careunit = as.character(first_careunit)
+  ) |>
+  ungroup()
+
+transfers_tbl |> print(width = Inf)
+```
+```{r}
+labevents_tbl <- mimic_icu_cohort_data %>%
+  select(
+    subject_id,
+    charttime,
+    "Creatinine",
+    "Potassium",
+    "Sodium",
+    "Chloride",
+    "Bicarbonate",
+    "Hematocrit",
+    "White_Blood_Cells",
+    "Glucose"
+  ) |>
+  mutate(charttime = as.POSIXct(charttime)) |>
+  ungroup()
+
+labevents_tbl |> print(width = Inf)
+```
+
+### 2.1 UI
+```{r shiny ui}
+# PART1: DEFINE UI
+ui <- fluidPage(
+  titlePanel("MIMIC-IV ICU Cohort"),
+  tabsetPanel(
+    tabPanel(
+      "Patient Characteristics",
+      sidebarLayout(
+        sidebarPanel( # SELECT BOX
+          selectInput("vars",
+            label = "Variable of Interest",
+            choices = c(
+              "First Care Unit",
+              "Last Care Unit",
+              "Admission Type",
+              "Admission Location",
+              "Discharge Location",
+              "Insurance",
+              "Language",
+              "Marital Status",
+              "Race",
+              "Gender",
+              "Age",
+              "Lab Events"
+            )
+          ),
+          # CHECKBOX
+          checkboxInput("rem_outliers",
+            label = "Remove Outliers in IQR method for measurements?",
+            value = FALSE
+          ),
+          helpText("Note: Removing outliers only applies to
+                   continuous variables Age and Lab Events.")
+        ),
+        mainPanel(
+          plotOutput("plot_pat_char"),
+
+          # CONDITIONAL ON AGE
+          conditionalPanel(
+            condition = "input.vars == 'Age'",
+            verbatimTextOutput("num_outliers_removed")
+          )
+        )
+      )
+    ),
+    tabPanel(
+      "Patient's ADT and ICU stay information",
+      sidebarLayout(
+        sidebarPanel(
+          selectizeInput("subject_id",
+            label = "Select a patient.",
+            # choices = 10012055, # to quickly test
+            choices = mimic_icu_cohort_data$subject_id,
+            options = list(
+              maxOptions = 5,
+              searchable = TRUE
+            )
+          )
+        ),
+        mainPanel(
+          plotOutput("plot_adt_icu")
+        )
+      )
+    ),
+    tabPanel(
+      "Numerical Summaries",
+      sidebarLayout(
+        sidebarPanel( # SELECT BOX
+          selectInput("numsum",
+            label = "Variable of Interest",
+            choices = c(
+              "First Care Unit",
+              "Last Care Unit",
+              "Admission Type",
+              "Admission Location",
+              "Discharge Location",
+              "Insurance",
+              "Language",
+              "Marital Status",
+              "Race",
+              "Gender",
+              "Age",
+              "Lab Events"
+            )
+          ),
+        ),
+        mainPanel(
+          verbatimTextOutput("summary")
+        ),
+      )
+    )
+  )
+)
+```
+
+### 2.2 Server
+
+```{r shiny server}
+# PART2: SERVER LOGIC
+server <- function(input, output) {
+  # Return the requested dataset
+  datasetInput <- reactive({
+    switch(input$vars,
+      "First Care Unit" = mimic_icu_cohort_data$first_careunit,
+      "Last Care Unit" = mimic_icu_cohort_data$last_careunit,
+      "Admission Type" = mimic_icu_cohort_data$admission_type,
+      "Admission Location" = mimic_icu_cohort_data$admission_location,
+      "Discharge Location" = mimic_icu_cohort_data$discharge_location,
+      "Insurance" = mimic_icu_cohort_data$insurance,
+      "Language" = mimic_icu_cohort_data$language,
+      "Marital Status" = mimic_icu_cohort_data$marital_status,
+      "Race" = mimic_icu_cohort_data$race,
+      "Gender" = mimic_icu_cohort_data$gender,
+      "Age" = mimic_icu_cohort_data$age_at_intime,
+      "Lab Events" = mimic_icu_cohort_data[, c(
+        "Creatinine",
+        "Potassium",
+        "Sodium",
+        "Chloride",
+        "Bicarbonate",
+        "Hematocrit",
+        "White_Blood_Cells",
+        "Glucose"
+      )]
+    )
+  })
+
+  # Generate a plot of the dataset chosen for Patient Characteristic
+  output$plot_pat_char <- renderPlot({
+    column <- datasetInput()
+
+    boxplot_outlier <- 16
+    # Remove outliers if checkbox is checked
+    if (input$rem_outliers) {
+      boxplot_outlier <- NA
+    }
+
+    # Lab Events Boxplot
+    if (input$vars == "Lab Events") {
+      lab_events_long <- mimic_icu_cohort_data |>
+        select(
+          "Creatinine",
+          "Potassium",
+          "Sodium",
+          "Chloride",
+          "Bicarbonate",
+          "Hematocrit",
+          "White_Blood_Cells",
+          "Glucose"
+        ) |>
+        pivot_longer(
+          cols = everything(),
+          names_to = "lab",
+          values_to = "value"
+        )
+
+      # Boxplot
+      ggplot(lab_events_long, aes(x = value, y = lab)) +
+        geom_boxplot(
+          fill = "white",
+          outlier.color = "blue",
+          outlier.shape = boxplot_outlier
+        ) +
+        labs(
+          title = paste("Boxplot of Lab Events"),
+          x = "Value",
+          y = "Variable"
+        ) +
+        theme_minimal() +
+        theme(legend.position = "none") +
+        scale_x_continuous(limits = c(0, 250))
+
+      # Age Histogram (continuous)
+    } else if (input$vars == "Age") {
+      # Remove Outliers
+      if (input$rem_outliers) {
+        age_col <- mimic_icu_cohort_data$age_at_intime
+
+        # IQR method
+        q1 <- quantile(age_col, 0.25, na.rm = TRUE)
+        q3 <- quantile(age_col, 0.75, na.rm = TRUE)
+        iqr <- q3 - q1
+        lower_bound <- q1 - 1.5 * iqr
+        upper_bound <- q3 + 1.5 * iqr
+
+        # Filter
+        age_no_outliers <- mimic_icu_cohort_data |>
+          filter(age_at_intime >= lower_bound & age_at_intime <= upper_bound)
+
+        num_out_removed <- length(age_col) -
+          length(age_no_outliers$age_at_intime)
+        output$num_outliers_removed <- renderText({
+          paste("Number of Outliers Removed: ", num_out_removed)
+        })
+
+        ggplot(age_no_outliers, aes(x = age_at_intime)) +
+          geom_histogram(fill = "#75AADB") +
+          labs(
+            title = paste("Histogram of Age"),
+            x = "Age",
+            y = "Count"
+          ) +
+          theme_minimal() +
+          scale_x_continuous(
+            breaks = seq(0, 100, by = 5),
+            limits = c(0, 100)
+          )
+      } else {
+        num_out_removed <- 0
+        output$num_outliers_removed <- renderText({
+          paste("Number of Outliers Removed: ", num_out_removed)
+        })
+        ggplot(mimic_icu_cohort_data, aes(x = age_at_intime)) +
+          geom_histogram(fill = "#75AADB") +
+          labs(
+            title = paste("Histogram of Age"),
+            x = "Age",
+            y = "Count"
+          ) +
+          theme_minimal() +
+          scale_x_continuous(
+            breaks = seq(0, 100, by = 5),
+            limits = c(0, 100)
+          )
+      }
+    } else {
+      # horizontal bar graph (categorical)
+      ggplot(mimic_icu_cohort_data, aes(x = column)) +
+        geom_bar(fill = "#75AADB") +
+        coord_flip() + # Make it horizontal
+        labs(
+          title = paste("Bar Graph of Patient Characteristic:", input$vars),
+          x = paste(input$vars, "Values"),
+          y = "Count"
+        ) +
+        theme_minimal()
+    }
+  })
+
+  # ADT and ICU Plot
+  output$plot_adt_icu <- renderPlot({
+    # Filter the data
+    patient_data <- mimic_icu_cohort_data |>
+      filter(subject_id == input$subject_id) |>
+      mutate(
+        charttime = as.POSIXct(charttime),
+        intime = as.POSIXct(intime),
+        outtime = as.POSIXct(outtime)
+      )
+
+    transfers_tbl <- transfers_tbl |>
+      filter(subject_id == input$subject_id) |>
+      mutate(
+        charttime = as.POSIXct(charttime),
+        intime = as.POSIXct(intime),
+        outtime = as.POSIXct(outtime)
+      )
+
+    labevents_tbl <- labevents_tbl |>
+      filter(subject_id == input$subject_id)
+
+    # the .rds doesnt have the procedures info? so need to read it in
+    # procedures_tbl <- read_csv("~/mimic/hosp/procedures_icd.csv.gz") |>
+    #   filter(subject_id == input$subject_id)
+
+    # base case: check for 0 rows
+    # if (nrow(patient_data) == 0) {
+    #   output$message <- renderText({
+    #     "No data available for the selected variable."
+    #   })
+    #   return(NULL)
+    # }
+
+    # Plot ADT
+    # Note: don't have access to procedures? was never loaded in Q1
+    p <- ggplot() +
+      geom_segment(data = transfers_tbl, aes(
+        x = intime,
+        xend = outtime,
+        y = "ADT",
+        yend = "ADT",
+        color = first_careunit,
+        # linewidth = ifelse(str_detect(first_careunit, "(ICU|ICCU)"), 1, 0)
+      )) +
+      geom_point(
+        data = labevents_tbl, aes(
+          x = charttime,
+          y = "Lab"
+        ),
+        shape = 3
+      ) +
+      scale_shape_manual(values = c(1:10)) +
+      labs(
+        x = "Calendar Time",
+        y = "",
+        title = paste("Patient",
+          patient_data$subject_id[1],
+          patient_data$gender[1],
+          patient_data$age_at_intime[1],
+          patient_data$race[1],
+          sep = ","
+        ),
+        shape = "ICU/CCU",
+        color = "Care Unit"
+      ) +
+      scale_y_discrete(limits = c("Lab", "ADT")) +
+      theme_minimal() +
+      theme(
+        legend.box = "vertical",
+        legend.position = "bottom",
+        legend.key.size = unit(0.5, "lines"),
+        legend.key.width = unit(0.5, "lines"),
+        legend.margin = margin(0, 50, 0, -50)
+      ) +
+      guides(
+        shape = guide_legend(order = 1), # Order of shape legend
+        color = guide_legend(order = 2), # Order of color legend
+        linewidth = "none"
+      )
+    return(p)
+  })
+
+  # NUMERICAL SUMMARIES
+  numsumInput <- reactive({
+    switch(input$numsum,
+      "First Care Unit" = mimic_icu_cohort_data$first_careunit,
+      "Last Care Unit" = mimic_icu_cohort_data$last_careunit,
+      "Admission Type" = mimic_icu_cohort_data$admission_type,
+      "Admission Location" = mimic_icu_cohort_data$admission_location,
+      "Discharge Location" = mimic_icu_cohort_data$discharge_location,
+      "Insurance" = mimic_icu_cohort_data$insurance,
+      "Language" = mimic_icu_cohort_data$language,
+      "Marital Status" = mimic_icu_cohort_data$marital_status,
+      "Race" = mimic_icu_cohort_data$race,
+      "Gender" = mimic_icu_cohort_data$gender,
+      "Age" = mimic_icu_cohort_data$age_at_intime,
+      "Lab Events" = mimic_icu_cohort_data[, c(
+        "Creatinine",
+        "Potassium",
+        "Sodium",
+        "Chloride",
+        "Bicarbonate",
+        "Hematocrit",
+        "White_Blood_Cells",
+        "Glucose"
+      )]
+    )
+  })
+
+
+  output$summary <- renderPrint({
+    dataset <- numsumInput()
+    # Factor chr variables
+    if (is.character(dataset)) {
+      dataset <- as.factor(dataset)
+    }
+    summary(dataset)
+  })
+}
+```
+
+
+### 2.3 Run Shiny
+
+NOTE: It will take some time to run and load all the patient's subject_ids, 
+and appear blank initially until the data is loaded. Comment out line 546/
+547 to go into testing mode (quickly loads single patient id).
+
+```{r run shiny}
+shinyApp(ui = ui, server = server)
+```
+
+#### Scratchwork (ignore)
+```{r eval = FALSE}
+mimic_icu_cohort_data |>
+  head() |>
+  print(width = Inf)
+```
+
+Test on single id
+```{r eval = FALSE}
+# TEST
+test_id <- 10002428
+
+transfers_tbl <- transfers_tbl |>
+  filter(subject_id == test_id) |>
+  mutate(
+    charttime = as.POSIXct(charttime),
+    intime = as.POSIXct(intime),
+    outtime = as.POSIXct(outtime)
+  )
+
+
+transfers_tbl |>
+  head() |>
+  print(width = Inf)
+
+labevents_tbl <- labevents_tbl |>
+  filter(subject_id == test_id)
+
+labevents_tbl |>
+  head() |>
+  print(width = Inf)
+```
+
+```{r eval = FALSE}
+ggplot() +
+  geom_segment(data = transfers_tbl, aes(
+    x = intime,
+    xend = outtime,
+    y = "ADT",
+    yend = "ADT",
+    color = first_careunit,
+    linewidth = str_detect(first_careunit, "(ICU|ICCU)")
+  )) +
+  geom_point(
+    data = labevents_tbl,
+    aes(x = charttime, y = "Lab"), shape = 3
+  )
+
+# bar plot of transfers_tbl
+```
+
+```{r eval = FALSE}
+plot_transfers <- ggplot(data = transfers_tbl, aes(x = intime, y = outtime)) +
+  geom_point() +
+  labs(
+    title = "Intime vs Outtime",
+    x = "Intime",
+    y = "Outtime"
+  )
+
+plot_transfers
+```
+
+
+```{r eval = FALSE}
+mimic_icu_cohort_data |>
+  select(
+    "Creatinine",
+    "Potassium",
+    "Sodium",
+    "Chloride",
+    "Bicarbonate",
+    "Hematocrit",
+    "White_Blood_Cells",
+    "Glucose"
+  ) |>
+  print(width = Inf)
+# LAB eevents boxplot
+lab_events_long <- mimic_icu_cohort_data |>
+  select(
+    "Creatinine",
+    "Potassium",
+    "Sodium",
+    "Chloride",
+    "Bicarbonate",
+    "Hematocrit",
+    "White_Blood_Cells",
+    "Glucose"
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "lab",
+    values_to = "value"
+  )
+
+lab_events_long |> print(width = Inf)
+
+# Boxplot
+ggplot(lab_events_long, aes(x = value, y = lab)) +
+  geom_boxplot(
+    fill = "white", outliers = FALSE,
+    outlier.color = "red", outlier.shape = 16
+  ) +
+  labs(
+    title = paste("Boxplot of Lab Events"),
+    x = "Value",
+    y = "Variable"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  scale_x_continuous(limits = c(0, 250))
+```
+
+```{r eval = FALSE}
+# AGE
+
+age_vector <- mimic_icu_cohort_data$age_at_intime
+
+filtered_age <- mimic_icu_cohort_data |>
+  filter(age_vector >= 70 & age_vector <= 80)
+
+filtered_age |> print(width = Inf)
+ggplot(filtered_age, aes(x = age_at_intime, y = Chloride)) +
+  geom_point() +
+  labs(
+    title = "Scatter Plot of Age",
+    x = "Age",
+    y = "Chloride", # selected dropdown
+  ) +
+  theme_minimal()
+
+filtered_age <- column |> filter(age_at_intime >=
+  input$age_range[1], age <= input$age_range[2])
+
+ggplot(mimic_icu_cohort_data, aes(x = filtered_age)) +
+  geom_histogram(fill = "#75AADB") +
+  labs(
+    title = "Histogram of Age",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r eval = FALSE}
+age_col <- mimic_icu_cohort_data$age_at_intime
+length(age_col)
+# IQR method
+
+q1 <- quantile(age_col, 0.25)
+q3 <- quantile(age_col, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+q1
+q3
+iqr
+lower_bound
+upper_bound
+
+# Filter
+age_no_outliers <- mimic_icu_cohort_data |>
+  filter(age_col >= lower_bound & age_col <= upper_bound)
+
+num_out_removed <- length(age_col) - length(age_no_outliers$age_at_intime)
+num_out_removed
+
+age_no_outliers |> print(width = Inf)
+
+ggplot(age_no_outliers, aes(x = age_at_intime)) +
+  geom_histogram(fill = "#75AADB") +
+  labs(
+    title = "Histogram of Age",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r eval = FALSE}
+age_col <- mimic_icu_cohort_data$age_at_intime
+length(age_col)
+# IQR method
+
+q1 <- quantile(age_col, 0.25)
+q3 <- quantile(age_col, 0.75)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+q1
+q3
+iqr
+lower_bound
+upper_bound
+
+# Filter
+age_no_outliers <- mimic_icu_cohort_data |>
+  filter(age_at_intime >= lower_bound & age_at_intime <= upper_bound)
+
+num_out_removed <- length(age_col) - length(age_no_outliers$age_at_intime)
+num_out_removed
+
+age_no_outliers |> print(width = Inf)
+
+ggplot(age_no_outliers, aes(x = age_at_intime)) +
+  geom_histogram(fill = "#75AADB") +
+  labs(
+    title = "Histogram of Age",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r eval = FALSE}
+ggplot(mimic_icu_cohort_data, aes(x = age_at_intime)) +
+  geom_histogram(fill = "#75AADB") +
+  labs(
+    title = "Histogram of Age",
+    x = "Age",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+
+```{r eval = FALSE}
+# OLD WORKING SOLUTION
+ggplot() +
+  # geom_segment(data = transfers_tbl, aes(
+  #   x = intime,
+  #   xend = outtime,
+  #   y = "ADT",
+  #   yend = "ADT",
+  #   color = first_careunit,
+  #   linewidth = str_detect(first_careunit, "(ICU|ICCU)")
+  # )) +
+  # geom_point(
+  #   data = labevents_tbl, aes(x = charttime, y = "Lab"),
+  #   shape = 3
+  # ) +
+  geom_segment(
+    data = transfers_tbl, aes(
+      x = intime,
+      xend = outtime,
+      y = "ADT",
+      yend = "ADT",
+      color = first_careunit,
+      linewidth = str_detect(
+        first_careunit,
+        "(ICU|CCU)"
+      )
+    )
+  ) +
+  geom_point(
+    data = labevents_tbl %>%
+      filter(subject_id == input$subject_id),
+    aes(x = as.POSIXct(charttime), y = "Lab"), shape = 3
+  ) +
+  scale_shape_manual(values = c(1:10)) +
+  labs(
+    x = "Calendar Time",
+    y = "",
+    title = paste("Patient",
+      patient_data$subject_id[1],
+      patient_data$gender[1],
+      patient_data$age_at_intime[1],
+      patient_data$race[1],
+      sep = ","
+    ),
+    shape = "ICU/CCU",
+    color = "Care Unit"
+  ) +
+  scale_y_discrete(limits = c("Lab", "ADT")) +
+  theme_minimal() +
+  theme(
+    legend.box = "vertical",
+    legend.position = "bottom",
+    legend.justification = "left",
+    legend.key.size = unit(0.5, "lines"),
+    legend.key.width = unit(0.5, "lines"),
+    legend.margin = margin(0, 50, 0, -50)
+  ) +
+  guides(
+    shape = guide_legend(order = 1), # Order of shape legend
+    color = guide_legend(order = 2), # Order of color legend
+    linewidth = "none"
+  )
+```
+
+```{r eval= FALSE}
+# factor for numeric summaries
+summary(mimic_icu_cohort_data$age_at_intime)
+
+mimic_icu_cohort_data$gender <- factor(mimic_icu_cohort_data$gender)
+
+summary(mimic_icu_cohort_data$gender)
+
+str(mimic_icu_cohort_data)
+```

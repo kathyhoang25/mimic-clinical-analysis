@@ -1,0 +1,1636 @@
+---
+title: "Biostat 203B Homework 5"
+subtitle: Due Mar 22 @ 11:59PM
+author: "Kathy Hoang and 506333118"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    number-sections: false
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    code-fold: false
+---
+
+## Predicting ICU duration
+
+Using the ICU cohort `mimiciv_icu_cohort.rds` you built in Homework 4, develop at least three machine learning approaches (logistic regression with enet regularization, random forest, boosting, SVM, MLP, etc) plus a model stacking approach for predicting whether a patient's ICU stay will be longer than 2 days. You should use the `los_long` variable as the outcome. You algorithms can use patient demographic information (gender, age at ICU `intime`, marital status, race), ICU admission information (first care unit), the last lab measurements before the ICU stay, and first vital measurements during ICU stay as features. You are welcome to use any feature engineering techniques you think are appropriate; but make sure to not use features that are not available at an ICU stay's `intime`. For instance, `last_careunit` cannot be used in your algorithms. 
+
+```{r}
+# clean environment
+rm(list = ls())
+```
+
+```{r}
+# load libraries
+library(bigrquery)
+library(dbplyr)
+library(DBI)
+library(gt)
+library(gtsummary)
+library(tidyverse)
+library(tidymodels)
+library(GGally)
+library(e1071) # skewedness
+library(keras)
+library(dials)
+library(stacks)
+library(vip)
+library(NeuralNetTools)
+
+
+## shared by Vem in OH to speed up the tuning process
+library(doMC)
+library(doParallel)
+library(foreach)
+```
+
+```{r load data}
+# updated .rds from hw4 folder  (Dr. Zhou said this was okay in OH)
+mimiciv_icu_cohort <- readRDS("../hw4/mimiciv_shiny/mimic_icu_cohort.rds")
+head(mimiciv_icu_cohort)
+```
+### 1. Data Preprocessing and Feature Engineering.
+In this section, I will clean, transform, and standardize the data to prepare
+the data for the machine learning models, in order to ensure data quality and 
+improve model performance. For example, I will handle missing values by 
+imputing, categorical variables with one-hot encoding, and skewed numerical 
+variables with log transformation. Note that some of the data preprocessing
+steps are done when creating the recipe for the models.
+
+When selecting features, I chose to keep the patient's demographic information,
+lab measurements, and vital signs. I believe these features can be important
+predictors of a patient's length of stay in the ICU. From the exploratory data
+analysis in hw3, I noticed that the length of stay did not vary much by
+insurance status and gender. Thus, I believe insurance status is an unnecessary
+predictor and removed it from the dataset. I intend to use gender to create new 
+ratio features, as some health measurements may differ by gender 
+(ex. normal range for Hematocrit). 
+
+```{r preprocessed dataset}
+# Select Relevant Columns
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort |>
+  # demographic info
+  select(
+    subject_id, hadm_id, stay_id, gender,
+    age_at_intime, marital_status, race, los_long,
+    # ICU admission information
+    # last lab measurements before the ICU stay (alrdy filtered)
+    first_careunit, Bicarbonate, Potassium, Chloride, Glucose,
+    Creatinine, Glucose, Hematocrit, Sodium, White_Blood_Cells,
+    # first vital measurements during ICU stay (alrdy filtered)
+    Non_Invasive_BP_diastolic, Non_Invasive_BP_systolic,
+    Temperature_Fahrenheit, Respiratory_Rate, Heart_Rate
+  )
+mimiciv_icu_cohort_preprocessed |> print(width = Inf)
+```
+
+```{r structure}
+str(mimiciv_icu_cohort_preprocessed)
+```
+After loading in the dataset, I observed the structure of the data and can see 
+that there is some cleaning up to do. First, I will check for missing values
+so that I can take note of which variables I will need to impute later. 
+
+#### Missing Values
+```{r missing values}
+missing_values <- colSums(is.na(mimiciv_icu_cohort_preprocessed))
+missing_values
+
+# need to impute missing values
+# only marital_status is categorical and has missing values, rest are numeric
+```
+After checking for missing values, I observed that the only categorical variable
+with missing values is `marital_status`. I will impute this with the mode of 
+the variable. The rest of the variables with missing values are numeric, and I
+will impute these with the mean of the variable. Note: this is done when 
+creating the recipe for the models.
+
+
+#### Outliers
+Because outliers do not conform with the pattern of the data, they can affect 
+the performance of the model and cause disruptions in the predictions. Thus,
+I chose to remove some outliers from the dataset.
+
+I examined the plots generated in the Exploratory Data Analysis (EDA) section
+in HW3 to identify which variables had outliers and needed to be removed.
+
+Some lab measurements, such as `Creatinine` and `White Blood Cells`, had 
+extremely high values. Additionally, some vitals had nonsensical outliers,
+such as `Heart Rate` of 0 and `Non Invasive Blood Pressure Systolic` with an 
+extremely high value. Instead of using the conventional IQR method, I only 
+removed the top and bottom 5% of extreme values. Considering the size of the
+large dataset, using the IQR method would result in a signficiant loss of 
+valuable data. Thus, I used the 5th and 95th percentiles of the data instead of
+25th and 75th percentiles to calculate the upper and lower bounds of the data. 
+I then removed any data points that were outside of these bounds.
+
+Some outliers I chose to keep because I thought they can contain meaningful 
+information and represent actual data points of interest. For example, 
+`Temperature Fahrenheit` may have some medical signficance behind extremely high 
+temperatures. Keeping these outliers could indicate critical medical 
+conditions and shed insights on patients' length of ICU stay. Thus, I only 
+removed temperatures that were extremely low, as these could be errors in the 
+data. For instance, getting a temperature of 0 degrees F.
+
+```{r outlier creatinine}
+# Outliers
+
+# Creatinine
+creat_col <- mimiciv_icu_cohort_preprocessed$Creatinine
+
+# IQR method but with 5th and 95th percentiles
+q1 <- quantile(creat_col, 0.05, na.rm = TRUE)
+q3 <- quantile(creat_col, 0.95, na.rm = TRUE)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Filter
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  filter(Creatinine >= lower_bound & Creatinine <= upper_bound)
+
+num_out_removed <- length(creat_col) -
+  length(mimiciv_icu_cohort_preprocessed$Creatinine)
+print(paste("Number of Outliers Removed: ", num_out_removed))
+```
+
+```{r outlier wbc}
+# Outliers
+
+# White_Blood_Cells
+wbc_col <- mimiciv_icu_cohort_preprocessed$White_Blood_Cells
+
+# IQR method but with 5th and 95th percentiles
+q1 <- quantile(wbc_col, 0.05, na.rm = TRUE)
+q3 <- quantile(wbc_col, 0.95, na.rm = TRUE)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Filter
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  filter(White_Blood_Cells >= lower_bound & White_Blood_Cells <= upper_bound)
+
+num_out_removed <- length(wbc_col) -
+  length(mimiciv_icu_cohort_preprocessed$White_Blood_Cells)
+print(paste("Number of Outliers Removed: ", num_out_removed))
+```
+
+```{r outlier heart rate}
+# Outliers
+
+# Heart Rate
+hr_col <- mimiciv_icu_cohort_preprocessed$Heart_Rate
+
+# IQR method but with 5th and 95th percentiles
+q1 <- quantile(hr_col, 0.05, na.rm = TRUE)
+q3 <- quantile(hr_col, 0.95, na.rm = TRUE)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Filter
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  filter(Heart_Rate >= lower_bound & Heart_Rate <= upper_bound)
+
+num_out_removed <- length(hr_col) -
+  length(mimiciv_icu_cohort_preprocessed$Heart_Rate)
+print(paste("Number of Outliers Removed: ", num_out_removed))
+```
+
+```{r outlier noninvasive bp diastolic}
+# Outliers
+
+# Non_Invasive_BP_diastolic
+nibpd_col <- mimiciv_icu_cohort_preprocessed$Non_Invasive_BP_diastolic
+
+# IQR method but with 5th and 95th percentiles
+q1 <- quantile(nibpd_col, 0.05, na.rm = TRUE)
+q3 <- quantile(nibpd_col, 0.95, na.rm = TRUE)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Filter
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  filter(Non_Invasive_BP_diastolic >= lower_bound &
+    Non_Invasive_BP_diastolic <= upper_bound)
+
+num_out_removed <- length(nibpd_col) -
+  length(mimiciv_icu_cohort_preprocessed$Non_Invasive_BP_diastolic)
+print(paste("Number of Outliers Removed: ", num_out_removed))
+```
+
+```{r outlier temperature}
+# Outliers
+
+# Temperature Fahrenheit
+nibpd_col <- mimiciv_icu_cohort_preprocessed$Temperature_Fahrenheit
+
+# IQR method
+q1 <- quantile(nibpd_col, 0.05, na.rm = TRUE)
+q3 <- quantile(nibpd_col, 0.95, na.rm = TRUE)
+iqr <- q3 - q1
+lower_bound <- q1 - 1.5 * iqr
+upper_bound <- q3 + 1.5 * iqr
+
+# Filter
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  filter(Temperature_Fahrenheit >= lower_bound &
+    Temperature_Fahrenheit <= upper_bound)
+
+num_out_removed <- length(nibpd_col) -
+  length(mimiciv_icu_cohort_preprocessed$Temperature_Fahrenheit)
+print(paste("Number of Outliers Removed: ", num_out_removed))
+```
+
+#### Factor Logical Variables
+For a classification model, the outcome should be a factor. Thus, I converted 
+the outcome variable `los_long` from a logical variable to a factor variable. 
+I converted it to a factor with levels "short" and "long". I also converted 
+the `gender` variable to a factor.
+
+
+```{r factor logical}
+# For a classification model, the outcome should be a `factor`,
+# not a `logical`.
+
+mimiciv_icu_cohort_preprocessed$los_long <-
+  factor(mimiciv_icu_cohort_preprocessed$los_long,
+    levels = c(FALSE, TRUE),
+    labels = c("short", "long")
+  )
+
+# mimiciv_icu_cohort_preprocessed |> mutate(
+#   los_long = factor(los_long,
+#                     levels = c("short", "long")))
+
+mimiciv_icu_cohort_preprocessed |> print(width = Inf)
+```
+
+```{r factor gender}
+# Convert gender to factor
+mimiciv_icu_cohort_preprocessed$gender <-
+  as.factor(mimiciv_icu_cohort_preprocessed$gender)
+
+glimpse(mimiciv_icu_cohort_preprocessed)
+unique(mimiciv_icu_cohort_preprocessed$first_careunit)
+```
+
+#### Log Transformations for Skewed Numerical Data
+Here, I check for skewed data to apply a log transformation to the numerical
+variables. I used the `skewness` function from the `e1071` package to calculate
+the skewness of the numerical variables. I then applied a log transformation to
+the variables that had a skewness greater than the absolute value of 0.5.
+
+Log transformation can be used as a data preprocessing step to normalize or 
+scale data. By reducing skewness, the data becomes more normally distributed
+and the model can make better predictions.
+
+```{r log transformations}
+# check for skewed data to apply log to numerical variables (lab)
+labs <- mimiciv_icu_cohort_preprocessed |>
+  select(
+    subject_id, stay_id, Bicarbonate, Chloride, Creatinine, Glucose,
+    Hematocrit, Potassium, Sodium, White_Blood_Cells
+  )
+
+lab_measurements_long <- labs |>
+  pivot_longer(
+    cols = -c(subject_id, stay_id), names_to = "lab",
+    values_to = "value"
+  ) |>
+  print(width = Inf)
+
+ggplot(lab_measurements_long, aes(x = value)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~lab, scales = "free") +
+  labs(x = "Lab Measurement", y = "Frequency") +
+  ggtitle("Distribution of Lab Measurements")
+
+skewness_labs <- lab_measurements_long %>%
+  group_by(lab) %>%
+  summarise(skewness = skewness(value, na.rm = TRUE))
+print(skewness_labs)
+```
+
+```{r}
+# check for skewed data to apply log to numerical variables (vitals)
+vitals <- mimiciv_icu_cohort_preprocessed |>
+  select(
+    subject_id, stay_id, Non_Invasive_BP_diastolic,
+    Non_Invasive_BP_systolic, Temperature_Fahrenheit,
+    Respiratory_Rate, Heart_Rate
+  )
+
+vitals_long <- vitals |>
+  pivot_longer(
+    cols = -c(subject_id, stay_id), names_to = "vitals",
+    values_to = "value"
+  ) |>
+  print(width = Inf)
+
+ggplot(vitals_long, aes(x = value)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~vitals, scales = "free") +
+  labs(x = "Vitals", y = "Frequency") +
+  ggtitle("Distribution of Vitals")
+
+skewness_vitals <- vitals_long %>%
+  group_by(vitals) %>%
+  summarise(skewness = skewness(value, na.rm = TRUE))
+print(skewness_vitals)
+```
+Seeing that some variables are skewed, I applied a log transformation to the
+lab measurements and vital signs that had a skewness far from 0.
+
+```{r}
+# Apply log transformation to skewed data (for loop) if skewedness > abs(0.5)
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(
+    # Bicarbonate = log(Bicarbonate + 1),
+    Chloride = log(Chloride + 1),
+    Creatinine = log(Creatinine + 1),
+    Glucose = log(Glucose + 1),
+    # Hematocrit = log(Hematocrit + 1),
+    Potassium = log(Potassium + 1),
+    # Sodium = log(Sodium + 1),
+    White_Blood_Cells = log(White_Blood_Cells + 1),
+    Non_Invasive_BP_diastolic = log(Non_Invasive_BP_diastolic + 1),
+    Non_Invasive_BP_systolic = log(Non_Invasive_BP_systolic + 1),
+    Temperature_Fahrenheit = log(Temperature_Fahrenheit + 1),
+    Respiratory_Rate = log(Respiratory_Rate + 1),
+    Heart_Rate = log(Heart_Rate + 1)
+  )
+
+mimiciv_icu_cohort_preprocessed
+```
+
+#### One Hot Encoding 
+
+To handle categorical variables, I used one hot encoding. I performed one hot
+encoding on `marital_status`, `race`, and `first_careunit`.
+
+```{r one hot encoding}
+# One Hot Encoding
+# GENDER
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(
+    married = ifelse(marital_status == "MARRIED", 1, 0),
+    single = ifelse(marital_status == "SINGLE", 1, 0),
+    widowed = ifelse(marital_status == "WIDOWED", 1, 0),
+    divorced = ifelse(marital_status == "DIVORCED", 1, 0)
+  ) |>
+  select(-marital_status)
+
+# shorter way
+# mimiciv_icu_cohort_preprocessed |>
+#   mutate(value = 1) |>
+#   pivot_wider(names_from = marital_status, values_from = value, values_fill
+# = 0)
+
+# RACE
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(
+    asian = ifelse(race == "ASIAN", 1, 0),
+    black = ifelse(race == "BLACK", 1, 0),
+    white = ifelse(race == "WHITE", 1, 0),
+    hispanic = ifelse(race == "HISPANIC", 1, 0),
+    other_race = ifelse(race == "Other", 1, 0)
+  ) |>
+  select(-race)
+
+# FIRST CAREUNIT
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(
+    micu = ifelse(
+      first_careunit == "Medical Intensive Care Unit (MICU) ", 1, 0
+    ),
+    sicu = ifelse(
+      first_careunit == "Surgical Intensive Care Unit (SICU)", 1, 0
+    ),
+    msicu = ifelse(
+      first_careunit == "Medical/Surgical Intensive Care Unit (MICU/SICU)", 1, 0
+    ),
+    cvicu = ifelse(
+      first_careunit == "Cardiac Vascular Intensive Care Unit (CVICU)", 1, 0
+    ),
+    other_careunit = ifelse(
+      first_careunit == "Other", 1, 0
+    )
+  ) |>
+  select(-first_careunit)
+
+
+mimiciv_icu_cohort_preprocessed |> print(width = Inf)
+```
+
+#### Creating New Features
+Reviewing the exploratory data analysis (EDA) from hw3, I observed which 
+features could be important for predicting long ICU stays. I did further 
+research and gathered domain knowledge to understand the normal ranges for 
+some lab measurements and vitals, and to create new features with 
+demographic information that could be useful for the model.
+
+I created new ratio features by dividing certain lab measurements by the
+patient's age. I thought that this could be useful because some health
+measurements may differ by age. For example, a high creatine level relative to
+age could indicate kidney dysfunction. Since kidney function decreases with
+age, a high creatinine to age ratio could indicate that the patient has elevated
+creatinine levels for their age. Another example is the heart rate to age ratio.
+This metric can provide insights on the patient's cardiovascular health relative
+to age and can be an important predictor of the patient's length of stay. Two
+new variables were created: `creatinine_age_ratio` and `heart_rate_age_ratio`.
+
+```{r creatinine and age}
+# creatinine and age
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(creatinine_age_ratio = Creatinine / age_at_intime)
+# low ratio is good
+
+# heart rate and age
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(heart_rate_age_ratio = Heart_Rate / age_at_intime)
+# low ratio is good
+```
+
+Seeing that `Hematocrit` was a key feature in the importance plot, I went back 
+and created a new variable called, `normal_hematocrit`, to indicate if the 
+levels of hematocrit is above or below a normal healthy threshold.
+
+After researching the normal ranges for Hematocrit, I learned that the normal
+range for Hematocrit is 40-53% for men and 36-48% for women. Thus, I created a
+new variable to indicate if the Hematocrit level was outside of this healthy
+range or not, depending on their gender. A severely low Hematocrit level (~25%)
+could indicate blood loss, dehydration, or anemia, while a severely high 
+Hematocrit level (~55%) could indicate dehydration or polycythemia.
+
+```{r EDA hematocrit and gender}
+# EDA hematocrit and gender
+mimiciv_icu_cohort_preprocessed |>
+  ggplot(aes(x = los_long, y = White_Blood_Cells, color = factor(gender))) +
+  geom_boxplot() +
+  labs(
+    title = "Hematocrit vs Length of Stay",
+    x = "Length of Stay",
+    y = "Hematocrit"
+  )
+
+# mimiciv_icu_cohort_preprocessed$Hematocrit
+```
+
+```{r normal hematocrit}
+# Create new var for Hematocrit
+
+normal_range_female <- c(36, 48)
+normal_range_male <- c(40, 53)
+
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  mutate(
+    normal_hematocrit = ifelse(
+      gender == "F" & Hematocrit >= normal_range_female[1] &
+        Hematocrit <= normal_range_female[2],
+      0, # Within Normal Range for Female
+      ifelse(
+        gender == "M" & Hematocrit >= normal_range_male[1] &
+          Hematocrit <= normal_range_male[2],
+        0, # Within Normal Range for Male
+        1 # Not Healthy (Outside Normal Range)
+      )
+    )
+  )
+mimiciv_icu_cohort_preprocessed$normal_hematocrit |> table()
+```
+
+
+### 2. Split Data
+
+2. Partition data into 50% training set and 50% test set. Stratify partitioning according to `los_long`. For grading purpose, sort the data by `subject_id`, `hadm_id`, and `stay_id` and use the seed `203` for the initial data split. Below is the sample code.
+```{r sample code}
+#| eval: false
+# set.seed(203)
+#
+# # sort
+# mimiciv_icu_cohort <- mimiciv_icu_cohort |>
+#   arrange(subject_id, hadm_id, stay_id)
+#
+# data_split <- initial_split(
+#   mimiciv_icu_cohort,
+#   # stratify by los_long
+#   strata = "los_long",
+#   prop = 0.5
+#   )
+#
+# data_split
+```
+
+```{r split data}
+# Partitioning the data
+table(mimiciv_icu_cohort_preprocessed$los_long)
+
+# set seed for reproducibility
+set.seed(203)
+
+# sort
+mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+  arrange(subject_id, hadm_id, stay_id)
+
+data_split <- initial_split(
+  mimiciv_icu_cohort_preprocessed,
+  # stratify by los_long
+  strata = "los_long",
+  prop = 0.5
+)
+
+data_split
+
+# training set
+train <- training(data_split) |>
+  arrange(subject_id, hadm_id, stay_id)
+# test set
+test <- testing(data_split) |>
+  arrange(subject_id, hadm_id, stay_id)
+levels(train$los_long)
+levels(test$los_long)
+
+# arrange the data again for grading purposes
+train
+test
+```
+
+```{r}
+# Split Data - My Way
+# set.seed(203)
+# mimiciv_icu_cohort_preprocessed <- mimiciv_icu_cohort_preprocessed |>
+#   arrange(subject_id, hadm_id, stay_id)
+#
+# train = mimiciv_icu_cohort_preprocessed %>% sample_frac(0.5) |>
+#   arrange(subject_id, hadm_id, stay_id)
+# test = mimiciv_icu_cohort_preprocessed %>% setdiff(train) |>
+#   arrange(subject_id, hadm_id, stay_id)
+#
+# levels(train$los_long)
+# levels(test$los_long)
+#
+# train
+# test
+```
+
+### 3. Training and Tuning
+3. Train and tune the models using the training set.
+
+#### Logistic Regression with Elastic Net
+```{r logistic regression}
+# Logistic Regression with
+logit_recipe <- recipe(
+  los_long ~ .,
+  data = train
+) |>
+  # HANDLE MISSING VALUES
+  step_impute_mean(all_numeric(), -all_outcomes()) |>
+  # step_meanimpute will impute missing values with the mean of the training set
+  # for all numeric variables except the outcome variable (los_long)
+  # step_impute_mode(marital_status) |>
+  step_impute_mode(all_nominal_predictors(), -all_outcomes()) |>
+  # use mode for categorical
+  step_mutate_at(all_logical(), fn = list(~ factor(.))) |>
+  # convert any logical var to factor
+  # zero variance
+  step_dummy(all_nominal_predictors()) |>
+  # dummy not needed for random forest
+  step_zv(all_numeric_predictors()) |>
+  # center and scale
+  step_normalize(all_numeric_predictors())
+
+# Create a model specification
+logit_mod <-
+  logistic_reg(
+    penalty = tune(),
+    mixture = tune()
+  ) |>
+  set_engine("glmnet", standardize = FALSE) |>
+  print()
+
+# Bundle the recipe and model into a workflow
+logit_wf <- workflow() |>
+  add_recipe(logit_recipe) |>
+  add_model(logit_mod) |>
+  print()
+
+# Tune
+logit_grid <- grid_regular(
+  penalty(range = c(-6, 3)),
+  mixture(),
+  levels = c(100, 5)
+) |>
+  print()
+
+# Cross-validation
+set.seed(212)
+logit_vfold <- vfold_cv(train, v = 5, strata = los_long)
+```
+
+```{r logit fit}
+# Using foreach parallel
+num_cores <- detectCores() - 2
+# leave 2 cores for other systems and processes
+# print(num_cores) 8-2=6
+registerDoParallel(cores = num_cores)
+# #Fit C-V
+
+system.time(
+  logit_fit <- logit_wf %>%
+    tune_grid(
+      resamples = logit_vfold,
+      grid = logit_grid,
+      metrics = metric_set(roc_auc, accuracy)
+    )
+)
+# Print the results
+logit_fit
+
+stopImplicitCluster()
+
+#   user  system elapsed
+#  35.485  17.927  16.097
+```
+
+
+```{r logit fit visual}
+# Visualize CV results
+logit_fit |>
+  # aggregate metrics from K folds
+  collect_metrics() |>
+  print(width = Inf) |>
+  filter(.metric == "roc_auc") |>
+  ggplot(mapping = aes(x = penalty, y = mean, color = factor(mixture))) +
+  geom_point() +
+  labs(x = "Penalty", y = "CV AUC") +
+  scale_x_log10()
+```
+```{r logit best}
+logit_fit |>
+  show_best("roc_auc")
+
+best_logit_fit <- logit_fit |>
+  select_best("roc_auc")
+best_logit_fit
+
+# Final workflow
+final_logit_wf <- logit_wf |>
+  finalize_workflow(best_logit_fit)
+
+# Fit the whole training set, then predict the TEST cases
+final_logit_fit <-
+  final_logit_wf |>
+  last_fit(data_split)
+final_logit_fit
+
+# Test metrics
+final_logit_fit |>
+  collect_metrics()
+```
+Note: the following two code chunks are meant to only be run to save the model
+with the highest accuracy and AUROC into an RDS file. Scores produced in the
+rendered output may differ from the ones saved in the RDS file.
+
+The first should only be run once to initialize the values. Set eval = TRUE if
+you would like to save and load the newly generated models into RDS files.
+
+```{r eval=FALSE}
+# ONLY RUN ONCE TO INITIALIZE VALUES!
+# comment out after to avoid overwriting
+highest_logit_accuracy <- 0
+highest_logit_auroc <- 0
+logit_accuracy_list <- c()
+logit_auroc_list <- c()
+```
+
+```{r eval=FALSE}
+# Save best logistic regression model
+
+logit_accuracy <- final_logit_fit %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+logit_accuracy
+
+logit_auroc <- final_logit_fit %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  pull(.estimate)
+logit_auroc
+
+# only replace if higher accuracy/roc
+if (logit_accuracy > highest_logit_accuracy) {
+  saveRDS(final_logit_fit, "final_logit_fit_accuracy.rds")
+  highest_logit_accuracy <- logit_accuracy
+  cat("Highest Accuracy:", highest_logit_accuracy, "\n")
+  # keep track of history of accuracy
+  logit_accuracy_list <- c(logit_accuracy_list, logit_accuracy)
+}
+
+if (logit_auroc > highest_logit_auroc) {
+  saveRDS(final_logit_fit, "final_logit_fit_auroc.rds")
+  highest_logit_auroc <- logit_auroc
+  cat("Highest AUROC:", highest_logit_auroc, "\n")
+  # keep track of history of accuracy and auroc
+  logit_auroc_list <- c(logit_auroc_list, logit_auroc)
+}
+```
+Highest Accuracy: 0.5741035
+Highest AUROC: 0.6028710
+
+Note: set `eval==TRUE` and uncomment below to load the best logistic regression 
+model from the RDS file. 
+```{r eval=FALSE}
+# Load best logistic regression model RDS
+# logit_rds_acc <- readRDS("final_logit_fit_accuracy.rds")
+# logit_rds_auroc <- readRDS("final_logit_fit_auroc.rds")
+```
+
+#### Random Forest
+```{r random forest}
+# Random Forest recipe
+rf_recipe <- recipe(
+  los_long ~ .,
+  data = train
+) |>
+  # step_dummy(all_nominal()) |>
+  # dummy not needed for random forest
+  # HANDLE MISSING VALUES
+  step_impute_mean(all_numeric(), -all_outcomes()) |>
+  # step_meanimpute will impute missing values with the mean of the training set
+  # for all numeric variables except the outcome variable (los_long)
+  step_impute_mode(all_nominal_predictors(), -all_outcomes()) |>
+  # use mode for categorical
+  # zero variance
+  step_zv(all_numeric_predictors())
+# step_normalize(all_numeric_predictors())
+# center and scale not needed for rf
+# step_mutate(los_long = factor(los_long, levels = c("short", "long")))
+
+# Create a model specification
+rf_mod <- rand_forest(
+  mode = "classification",
+  mtry = tune(),
+  # trees = tune(),
+  trees = tune()
+) |>
+  # importance = TRUE) |>
+  set_engine("ranger", importance = "impurity")
+
+rf_mod
+
+# Bundle the recipe and model into a workflow
+rf_wf <- workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_mod)
+
+# Tune
+rf_grid <- grid_regular(
+  trees(range = c(100L, 300L)),
+  mtry(range = c(1L, 5L)),
+  levels = c(3, 5)
+)
+rf_grid
+
+# Cross-validation
+set.seed(212)
+rf_vfold <- vfold_cv(train, v = 5, strata = los_long)
+```
+
+```{r random forest fit}
+# Using foreach parallel
+num_cores <- detectCores() - 2
+registerDoParallel(cores = num_cores)
+
+# Fit C-V
+system.time(
+  rf_fit <- rf_wf %>%
+    tune_grid(
+      resamples = rf_vfold,
+      grid = rf_grid,
+      metrics = metric_set(roc_auc, accuracy)
+    )
+)
+
+# Print the results
+rf_fit
+
+stopImplicitCluster()
+
+# user  system elapsed
+# 502.885  16.658 181.793
+# 408.261  18.776 148.661  updated reduced time
+```
+
+```{r random forest fit visual}
+rf_fit %>%
+  collect_metrics() %>%
+  print(width = Inf) %>%
+  filter(.metric == "roc_auc") %>%
+  mutate(mtry = as.factor(mtry)) %>%
+  ggplot(mapping = aes(x = trees, y = mean, color = mtry)) +
+  # geom_point() +
+  geom_line() +
+  labs(x = "Number of Trees", y = "CV AUC")
+```
+
+```{r random forest best}
+rf_fit |>
+  show_best("roc_auc")
+
+best_rf_fit <- rf_fit |>
+  select_best("roc_auc")
+best_rf_fit
+
+# Final workflow
+final_wf_rf <- rf_wf |>
+  finalize_workflow(best_rf_fit)
+
+# Fit the whole training set, then predict the test cases
+final_fit_rf <-
+  final_wf_rf |>
+  last_fit(data_split)
+final_fit_rf
+
+# Test metrics
+final_fit_rf |>
+  collect_metrics()
+```
+
+Note: the following two code chunks are meant to only be run to save the model
+with the highest accuracy and AUROC into an RDS file. Scores produced in the
+rendered output may differ from the ones saved in the RDS file.
+
+The first should only be run once to initialize the values. Set eval = TRUE if
+you would like to save and load the newly generated models into RDS files.
+```{r eval=FALSE}
+# ONLY RUN ONCE TO INITIALIZE VALUES!
+# comment out after to avoid overwriting
+highest_rf_accuracy <- 0
+highest_rf_auroc <- 0
+rf_accuracy_list <- c()
+rf_auroc_list <- c()
+```
+
+```{r eval=FALSE}
+# Save best random forest model
+
+rf_accuracy <- final_fit_rf %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+rf_accuracy
+
+rf_auroc <- final_fit_rf %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  pull(.estimate)
+rf_auroc
+
+
+# only replace if higher accuracy/roc
+if (rf_accuracy > highest_rf_accuracy) {
+  saveRDS(final_fit_rf, "final_rf_fit_accuracy.rds")
+  highest_rf_accuracy <- rf_accuracy
+  cat("Highest Accuracy:", highest_rf_accuracy, "\n")
+  # keep track of history of accuracy
+  rf_accuracy_list <- c(rf_accuracy_list, rf_accuracy)
+}
+
+if (rf_auroc > highest_rf_auroc) {
+  saveRDS(final_fit_rf, "final_rf_fit_auroc.rds")
+  highest_rf_auroc <- rf_auroc
+  cat("Highest AUROC:", highest_rf_auroc, "\n")
+  # keep track of history of accuracy and auroc
+  rf_auroc_list <- c(rf_auroc_list, rf_auroc)
+}
+```
+Highest Accuracy: 0.5816559 
+Highest AUROC: 0.6234321 
+
+Note: set `eval==TRUE` and uncomment below to load the best random forest model 
+from the RDS file. 
+
+```{r eval=FALSE}
+# Load best logistic regression model RDS
+# rf_rds_acc <- readRDS("final_rf_fit_accuracy.rds")
+# rf_rds_auroc <- readRDS("final_rf_fit_auroc.rds")
+```
+
+#### Boosting
+
+```{r boosting}
+# Boosting recipe
+gb_recipe <- recipe(
+  los_long ~ .,
+  data = train
+) |>
+  # HANDLE MISSING VALUES
+  step_impute_mean(all_numeric(), -all_outcomes()) |>
+  # step_meanimpute will impute missing values with the mean of the training set
+  # for all numeric variables except the outcome variable (los_long)
+  # step_impute_mode(marital_status) |>
+  step_impute_mode(all_nominal_predictors(), -all_outcomes()) |>
+  # use mode for categorical
+  step_dummy(all_nominal_predictors()) |>
+  # create traditional dummy variables (necessary for xgboost)
+  step_zv(all_numeric_predictors())
+# zero variance
+# step_mutate(los_long = factor(los_long, levels = c("short", "long")))
+
+# Create a model specification
+gb_mod <-
+  boost_tree(
+    mode = "classification",
+    trees = 500, # reduce trees for faster tuning
+    # trees = 500, # reduce for faster tuning
+    tree_depth = tune(),
+    learn_rate = tune()
+  ) |>
+  set_engine("xgboost")
+gb_mod
+
+# Bundle the recipe and model into a workflow
+gb_wf <- workflow() |>
+  add_recipe(gb_recipe) |>
+  add_model(gb_mod)
+gb_wf
+
+# Tune
+gb_grid <- grid_regular(
+  tree_depth(range = c(1L, 3L)),
+  learn_rate(range = c(-3, 2), trans = log10_trans()),
+  # levels = c(3, 5) # reduced levels
+  levels = c(2, 3) # reduce levels for faster tuning
+)
+gb_grid
+
+# Cross-validation
+set.seed(212)
+gb_vfold <- vfold_cv(train, v = 5, strata = los_long)
+```
+
+```{r boosting fit}
+# Using foreach parallel
+num_cores <- detectCores() - 2
+registerDoParallel(cores = num_cores)
+
+system.time(
+  gb_fit <- gb_wf |>
+    tune_grid(
+      resamples = gb_vfold,
+      grid = gb_grid,
+      metrics = metric_set(roc_auc, accuracy)
+    )
+)
+gb_fit
+
+stopImplicitCluster()
+
+
+# levels = c(3, 6)
+#   user  system elapsed
+# 833.504  10.397 475.504
+
+# levels = c(2, 3)
+# learn_rate(range = c(-3, 2) most updated!!
+#   user  system elapsed
+# 149.837   1.412  39.031
+```
+
+```{r boosting fit visual}
+gb_fit |>
+  collect_metrics() |>
+  print(width = Inf) |>
+  filter(.metric == "roc_auc") |>
+  ggplot(mapping = aes(x = learn_rate, y = mean, color = factor(tree_depth))) +
+  geom_point() +
+  labs(x = "Learning Rate", y = "CV AUC") +
+  scale_x_log10()
+```
+
+```{r}
+gb_fit |>
+  show_best("roc_auc")
+
+best_gb_fit <- gb_fit |>
+  select_best("roc_auc")
+best_gb_fit
+
+# Final workflow
+final_wf_gb <- gb_wf |>
+  finalize_workflow(best_gb_fit)
+
+# Fit the whole training set, then predict the test cases
+final_fit_gb <-
+  final_wf_gb |>
+  last_fit(data_split)
+
+# Test metrics
+final_fit_gb |>
+  collect_metrics()
+
+# accuracy	binary	0.5851712	Preprocessor1_Model1
+# roc_auc	binary	0.6191067	Preprocessor1_Model1
+```
+Note: the following two code chunks are meant to only be run to save the model
+with the highest accuracy and AUROC into an RDS file. Scores produced in the
+rendered output may differ from the ones saved in the RDS file.
+
+The first should only be run once to initialize the values. Set eval = TRUE if
+you would like to save and load the newly generated models into RDS files.
+```{r eval=FALSE}
+# ONLY RUN ONCE TO INITIALIZE VALUES!
+# comment out after to avoid overwriting
+highest_gb_accuracy <- 0
+highest_gb_auroc <- 0
+gb_accuracy_list <- c()
+gb_auroc_list <- c()
+```
+
+```{r eval=FALSE}
+# Save best boosting model
+
+gb_accuracy <- final_fit_gb %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+gb_accuracy
+
+gb_auroc <- final_fit_gb %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  pull(.estimate)
+gb_auroc
+
+# only replace if higher accuracy/roc
+if (gb_accuracy > highest_gb_accuracy) {
+  saveRDS(final_fit_gb, "final_gb_fit_accuracy.rds")
+  highest_gb_accuracy <- gb_accuracy
+  cat("Highest Accuracy:", highest_gb_accuracy, "\n")
+  # keep track of history of accuracy
+  gb_accuracy_list <- c(gb_accuracy_list, gb_accuracy)
+}
+
+if (gb_auroc > highest_gb_auroc) {
+  saveRDS(final_fit_gb, "final_gb_fit_auroc.rds")
+  highest_gb_auroc <- gb_auroc
+  cat("Highest AUROC:", highest_gb_auroc, "\n")
+  # keep track of history of accuracy and auroc
+  gb_auroc_list <- c(gb_auroc_list, gb_auroc)
+}
+```
+Highest Accuracy: 0.5845895 
+Highest AUROC: 0.6194448 
+
+Note: set `eval==TRUE` and uncomment below to load the best boosting models from 
+the RDS file. 
+```{r eval=FALSE}
+# Load best logistic regression model RDS
+# gb_rds_acc <- readRDS("final_gb_fit_accuracy.rds")
+# gb_rds_auroc <- readRDS("final_gb_fit_auroc.rds")
+```
+
+#### Multi-Layer Perceptron (MLP) 
+
+```{r mlp}
+# multi-layer perceptron (MLP)  recipe
+mlp_recipe <- recipe(
+  los_long ~ .,
+  data = train
+) |>
+  # HANDLE MISSING VALUES
+  step_impute_mean(all_numeric(), -all_outcomes()) |>
+  # step_meanimpute will impute missing values with the mean of the training set
+  # for all numeric variables except the outcome variable (los_long)
+  # step_impute_mode(marital_status) |>
+  # use mode for categorical
+  step_impute_mode(all_nominal_predictors(), -all_outcomes()) |>
+  # alternative way to do all categorical
+  step_dummy(all_nominal_predictors()) |>
+  # create dummy variables
+  step_zv(all_numeric_predictors()) |>
+  # zero variance
+  step_normalize(all_numeric_predictors())
+# center and scale numeric data
+# step_mutate(los_long = factor(los_long, levels = c("short", "long")))
+
+# Create a model specification
+mlp_mod <-
+  mlp(
+    mode = "classification",
+    hidden_units = tune(),
+    # dropout = tune(),
+    penalty = tune(), # Add regularization
+    epochs = tune(),
+  ) |>
+  set_engine("nnet", verbose = 0)
+mlp_mod
+
+# Bundle the recipe and model into a workflow
+mlp_wf <- workflow() %>%
+  add_recipe(mlp_recipe) %>%
+  add_model(mlp_mod)
+
+# Tune
+# mlp_grid <- grid_regular(
+#   hidden_units(range = c(1, 20)),
+#   levels = 5
+#   )
+# mlp_grid
+
+# simplified tuning grid
+# mlp_grid <- grid_regular(
+#   hidden_units(range = c(1, 10)), #reduced range
+#   penalty = 2,
+#   epochs = 10,
+#   levels = 10
+# )
+# mlp_grid
+
+mlp_grid <- grid_random(
+  hidden_units() %>% range_set(c(1, 5)),
+  penalty() %>% range_set(c(0.01, 0.1)),
+  epochs() %>% range_set(c(5, 10)),
+  size = 10
+)
+# dials changed its parameter objects to be functions instead of
+# pre-compiled objects
+
+# Cross-validation
+set.seed(203)
+mlp_vfold <- vfold_cv(train, v = 5, strata = los_long)
+```
+```{r mlp fit}
+# Using foreach parallel
+num_cores <- detectCores() - 2
+registerDoParallel(cores = num_cores)
+
+# Fit the model
+system.time(
+  mlp_fit <- mlp_wf %>%
+    tune_grid(
+      resamples = mlp_vfold,
+      grid = mlp_grid,
+      metrics = metric_set(roc_auc, accuracy)
+    )
+)
+
+# Print the results
+mlp_fit
+
+stopImplicitCluster()
+
+# user  system elapsed
+# 197.154   2.772  53.083
+
+#  6.648   1.392   5.276 most updated!! simplified grid
+```
+
+```{r mlp fit visual}
+# Visualize CV results
+mlp_fit %>%
+  collect_metrics() %>%
+  print(width = Inf) %>%
+  filter(.metric == "roc_auc") %>%
+  ggplot(mapping = aes(x = penalty, y = mean, color = factor(hidden_units))) +
+  geom_point() +
+  labs(x = "Hidden Units", y = "CV AUC")
+```
+
+```{r mlp best}
+mlp_fit |>
+  show_best("roc_auc")
+
+best_mlp_fit <- mlp_fit |>
+  select_best("roc_auc")
+best_mlp_fit
+
+# Final workflow
+final_wf_mlp <- mlp_wf |>
+  finalize_workflow(best_mlp_fit)
+
+# Fit the whole training set, then predict the test cases
+final_fit_mlp <-
+  final_wf_mlp |>
+  last_fit(data_split)
+
+# Test metrics
+final_fit_mlp |>
+  collect_metrics()
+```
+Note: the following two code chunks are meant to only be run to save the model
+with the highest accuracy and AUROC into an RDS file. Scores produced in the
+rendered output may differ from the ones saved in the RDS file.
+
+The first should only be run once to initialize the values. Set eval = TRUE if
+you would like to save and load the newly generated models into RDS files.
+```{r eval=FALSE}
+# ONLY RUN ONCE TO INITIALIZE VALUES!
+# comment out after to avoid overwriting
+highest_mlp_accuracy <- 0
+highest_mlp_auroc <- 0
+mlp_accuracy_list <- c()
+mlp_auroc_list <- c()
+```
+
+```{r eval=FALSE}
+# Save best mlp model
+
+mlp_accuracy <- final_fit_mlp %>%
+  collect_metrics() %>%
+  filter(.metric == "accuracy") %>%
+  pull(.estimate)
+mlp_accuracy
+
+mlp_auroc <- final_fit_mlp %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  pull(.estimate)
+mlp_auroc
+
+# only replace if higher accuracy/roc
+if (mlp_accuracy > highest_mlp_accuracy) {
+  saveRDS(final_fit_mlp, "final_mlp_fit_accuracy.rds")
+  highest_mlp_accuracy <- mlp_accuracy
+  cat("Highest Accuracy:", highest_mlp_accuracy, "\n")
+  # keep track of history of accuracy
+  mlp_accuracy_list <- c(mlp_accuracy_list, mlp_accuracy)
+}
+
+if (mlp_auroc > highest_mlp_auroc) {
+  saveRDS(final_fit_mlp, "final_mlp_fit_auroc.rds")
+  highest_mlp_auroc <- mlp_auroc
+  cat("Highest AUROC:", highest_mlp_auroc, "\n")
+  # keep track of history of accuracy and auroc
+  mlp_auroc_list <- c(mlp_auroc_list, mlp_auroc)
+}
+```
+Highest Accuracy: 0.5708891 
+Highest AUROC: 0.5992738 
+
+Note: set eval==TRUE and uncomment below to load the best mlp model 
+from the RDS file. 
+```{r eval=FALSE}
+# Load best logistic regression model RDS
+# rf_rds_acc <- readRDS("final_mlp_fit_accuracy.rds")
+# rf_rds_auroc <- readRDS("final_mlp_fit_auroc.rds")
+```
+
+#### Model Stacking (Ensemble)
+
+Set up base models.
+
+```{r}
+# model_control <- control_stack_grid(save_pred = TRUE, save_workflow = TRUE)
+# model_metrics <- metric_set(roc_auc, accuracy)
+```
+
+```{r model stacking logit}
+num_cores <- detectCores() - 2
+registerDoParallel(cores = num_cores)
+
+# logistic regression with elastic net
+system.time(
+  logit_res <-
+    tune_grid(
+      object = logit_wf,
+      resamples = logit_vfold,
+      grid = logit_grid,
+      control = control_stack_grid()
+    )
+)
+logit_res
+
+# user  system elapsed
+# 33.789  19.382  24.859
+```
+
+```{r model stacking rf}
+# random forest
+system.time(
+  rf_res <-
+    tune_grid(
+      object = rf_wf,
+      resamples = rf_vfold,
+      grid = rf_grid,
+      control = control_stack_grid()
+    )
+)
+rf_res
+#   user  system elapsed
+# 632.073  16.587 128.769
+```
+
+```{r model stacking mlp}
+system.time(
+  mlp_res <-
+    tune_grid(
+      object = mlp_wf,
+      resamples = mlp_vfold,
+      grid = mlp_grid,
+      control = control_stack_grid()
+    )
+)
+mlp_res
+
+# user  system elapsed
+# 16.422   2.944   4.796
+```
+
+Ensemble model:
+I chose to stack the following models: `logistic regression with elastic net` 
+and `random forest`. I could not include the MLP model because it took too long 
+to run and R would terminate before it could complete.
+
+Note that running this next chunk of code will take a long time to run 
+(1-2hours), so I set it to `eval=FALSE` and saved it in an RDS file to render it
+quickly in the final report. Please set `eval=TRUE` to run the code for 
+reproducible results.
+```{r eval= FALSE}
+system.time(
+  ensemble_model_st <-
+    # initialize the stack
+    stacks() |>
+    # add candidate members
+    add_candidates(logit_res) |>
+    add_candidates(rf_res) |>
+    # add_candidates(mlp_res) |> takes too long to run
+    # determine how to combine their predictions
+    blend_predictions(
+      # penalty = 10^(-6:2),
+      penalty = 10^(-3:2), # reduced penalty
+      metrics = c("roc_auc")
+    ) |>
+    # fit the candidates with nonzero stacking coefficients
+    fit_members(faster = TRUE) # use faster = TRUE to speed up the process
+)
+
+stopImplicitCluster()
+
+# user   system  elapsed
+# 1463.930 1166.725 5858.474
+# 1290.165  968.434 3944.669 UPDATED
+# 1285.459  901.207 4301.244
+```
+
+Uncomment the code and set =TRUE below to save the ensemble model to 
+an RDS file.
+```{r eval=FALSE}
+# ensemble_model_st |> write_rds("ensemble_model_st.rds", compress = "gz")
+```
+
+```{r load ensemble model}
+# load ensemble model
+ensemble_model_st <- readRDS("ensemble_model_st.rds")
+```
+
+```{r autoplot ensemble}
+autoplot(ensemble_model_st)
+```
+```{r autoplot member weights}
+autoplot(ensemble_model_st, type = "member")
+autoplot(ensemble_model_st, type = "weights")
+```
+
+
+```{r collect parameters}
+collect_parameters(ensemble_model_st, "logit_res")
+collect_parameters(ensemble_model_st, "rf_res")
+```
+```{r ensemble final classification}
+# FINAL CLASSIFICATION
+mimic_pred <- test %>%
+  bind_cols(predict(ensemble_model_st, ., type = "prob")) %>%
+  print(width = Inf)
+```
+
+```{r ensemble roc auc}
+ensemble_roc <- yardstick::roc_auc(
+  mimic_pred,
+  truth = los_long,
+  contains(".pred_short")
+)
+```
+
+```{r ensemble pred results}
+mimic_pred_results <-
+  test |>
+  select(los_long) |>
+  bind_cols(
+    predict(
+      ensemble_model_st,
+      test,
+      type = "class",
+      members = TRUE
+    )
+  ) |>
+  print(width = Inf)
+```
+
+```{r predictions}
+map(
+  colnames(mimic_pred_results),
+  ~ mean(mimic_pred_results$los_long == pull(mimic_pred_results, .x))
+) |>
+  set_names(colnames(mimic_pred_results)) |>
+  as_tibble() |>
+  pivot_longer(c(everything(), -los_long))
+```
+
+### 4. Comparing Model Performance
+
+Note: I loaded these models from the RDS files to avoid running the code again. 
+If you would like to reproduce these results, you may also uncomment the code
+in the code chunk below titled "load fitted models", which has the same 
+variable names as the models that were run above. Please uncomment and set 
+`eval == TRUE` to run.
+```{r read RDS models}
+# Load best logistic regression model RDS
+logit_model <- readRDS("final_logit_fit_accuracy.rds")
+
+# Load best random forest model RDS
+rf_model <- readRDS("final_rf_fit_accuracy.rds")
+
+# Load best gradient boosting model RDS
+gb_model <- readRDS("final_gb_fit_accuracy.rds")
+
+# Load best Multi-Layer Perceptron (MLP) model RDS
+mlp_model <- readRDS("final_mlp_fit_accuracy.rds")
+```
+
+#### Importance Plots
+```{r}
+# Importance Plots
+
+# Logistic Regression
+logit_model %>%
+  extract_fit_parsnip() %>%
+  vip()
+```
+```{r}
+# random forest
+rf_model %>%
+  extract_fit_parsnip() %>%
+  vip()
+```
+
+```{r}
+# gradient boosting
+gb_model %>%
+  extract_fit_parsnip() %>%
+  vip()
+```
+
+```{r}
+# Multi-Layer Perceptron (MLP)
+mlp_model %>%
+  extract_fit_parsnip() %>%
+  vip()
+```
+Please uncomment code chunk below for reproducible results.
+```{r load fitted models, eval=FALSE}
+# load fitted models
+
+# Please uncomment and set eval = TRUE to run.
+#
+# #Logistic Regression
+# final_logit_fit %>%
+#   extract_fit_parsnip() %>%
+#   vip()
+# logit_model<-final_logit_fit
+
+# #random forest
+# final_fit_rf %>%
+#   extract_fit_parsnip() %>%
+#   vip()
+# rf_model<-final_fit_rf
+#
+# #gradient boosting
+# final_fit_gb %>%
+#   extract_fit_parsnip() %>%
+#   vip()
+# gb_model<-final_fit_gb
+#
+# #Multi-Layer Perceptron (MLP)
+# final_fit_mlp %>%
+#   extract_fit_parsnip() %>%
+#   vip()
+# mlp_model<-final_fit_mlp
+```
+
+#### Model Performance Comparison
+```{r compare model performance}
+# Compare model classification performance on the test set
+logit_model |> collect_metrics()
+
+rf_model |> collect_metrics()
+
+gb_model |> collect_metrics()
+
+mlp_model |> collect_metrics()
+
+ensemble_roc
+```
+Compare model classification performance on the test set. Report both the area under ROC curve and accuracy for each machine learning algorithm and the model stacking. Interpret the results. What are the most important features in predicting long ICU stays? How do the models compare in terms of performance and interpretability?
+
+**Summary of Model Performance:**
+
+The results of the model performance are summarized below.
+
+| Method | Accuracy | AUROC |
+|:------:|:------:|:------:|:------:|
+| Logistic Regression with enet | 0.5741035 | 0.6028710 | |
+| Random Forest | 0.5796274 | 0.6234321 | |
+| Gradient Boosting | 0.5845895 |0.6194448 | |
+| MLP |0.5708891 |0.5992738. | |
+| Ensemble | - - | 0.6268539 | |
+
+**Model Comparison: Performance**
+
+I used area under the Receiver Operating Characteristic (AUROC) and accuracy 
+metrics to evaluate the classification performance of several models: 
+Logistic Regression with elastic net, Random Forest, Gradient Boosting, 
+Multi-Layer Perceptron (MLP), and Ensemble Model Stack with Logistic Regression 
+Enet and Random Forest. 
+
+Among the individual models, the Random Forest model achieved the 
+highest AUROC score of about 0.623, while the Gradient Boosting model had the
+highest accuracy of 0.5845895. The MLP model performed the worst as it had the 
+lowest accuracy and AUROC of 0.5708891 and 0.5992738, respectively. 
+
+Overall, the ensemble model outperformed all other models with an AUROC of 
+0.6268539. This reflects the power of combining multiple models to improve
+predictive performance.
+
+**Important Features and Interpretation of Results:**
+
+To interpret the results, I used the Variable Importance Plot (VIP) to identify
+the most important features in predicting long ICU stays. The VIP plots depict
+the relative importance of each feature for each model. 
+
+All of the models except MLP captured `Hematocrit` as the most important feature
+in predicting long ICU stays. MLP failed to even identify `Hematocrit` as an 
+important feature. This could be due to the complexity of the model with the 
+structure of the neural network or the tuning parameters used. Perhaps the
+number of epochs or hidden units was not sufficient to capture the importance of
+`Hematocrit` as I had to greatly reduce it to expedite the tuning time.
+
+However, MLP was able to identify many of the same top features other models
+recognized as important predictors of long ICU stays, such as `age_at_intime`, 
+`White_Blood_Cells`, `Heart_Rate`, and `Temperature_Fahrenheit`. We can infer
+that age is a crucial predictor of long ICU stays because older patients are
+more likely to have longer ICU stays. Similarly, abnormal values of white blood
+cells, heart rate, and temperature are indicative of underlying health issues
+that may require longer ICU stays.
+
+Interestingly, the first care unit played an pivotal role in only the logistic 
+regression with enet regularization, which suggests that the type of care unit
+may influence the length of stay in the ICU. This makes sense as different care
+units have varying levels of care depending on the severity of the patient's
+condition, which could impact the length of stay.
+
+Some of the features I created in the feature engineering step emerged as top 
+predictors as well. For example, `heart_rate_age_ratio` and `creatine_age_ratio`
+appeared in the top features in the VIP plot for Random Forest. This suggests
+that the ratios of heart rate and creatine to age are important predictors of
+long ICU stays, and creating these features helped improve the model's
+performance. This algins with what I observed, as most of the models' accuracy 
+and AUROC increased after I implemented this feature engineering step.
+
+**Model Comparison: Interpretability:**
+
+In terms of interpretability, the Logistic Regression model with elastic net
+regularization is the most interpretable model. It provides coefficients for
+each feature, which allows us to understand the direction and strength of the
+relationship between the features and the outcome variable, `los_long`. In this
+case, we know that the first care unit and `Hematocrit` have the most influence
+in determining whether the patient will have a long ICU stay.
+
+On the other hand, Random Forest and Gradient Boosting models are less 
+interpretable because they are based on ensembles of decision trees, which are 
+more complex and difficult to interpret. While they offer high predictive
+power and can capture complex relationships between features, the tradeoff is
+that they are less interpretable.
+
+Compared to the other models, Random Forest shows that the importance levels 
+across the features are not that different, which makes it harder to pinpoint 
+the most important features. For example, Hematocrit is the most important 
+feature in Random Forest, but its importance level is only marginally higher 
+than the next 9 important features. 
+
+In contrast, Gradient Boosting shows a stark contrast between Hematocrit and 
+the second most important feature, which is `age_at_intime`. However, the rest
+of the features are close to each other in importance level so it becomes 
+unclear which other features significantly impact the predictions.
+
+The MLP model is even more complex than Random Forest and Gradient Boosting
+because it is a neural network with multiple layers of interconnected nodes.
+The ensemble model is also less interpretable because it combines multiple
+models, making it challenging to understand how each model contributes to the
+final prediction.
